@@ -1,0 +1,7 @@
+{
+  "meta": {
+    "title": "Codex 会话",
+    "description": "在 DeepSeek Harness 里开新的、或接着已有的 Codex 会话做。codex_thread_new 在指定目录开一个新会话并返回它的 id；codex_thread_read 接受这个 id、已有会话 id、codex://threads/<id> 链接或 rollout 路径，返回该会话的工作目录、模型、Codex 此刻是否正在跑这一轮，以及最近的消息。codex_thread_send 继续同一个会话而不是另开一个，按情况走三条路：用 `codex exec` 新建、会话空闲时用 `codex exec resume` 起一轮由本进程持有、Codex 应用占着写锁时改用 `codex queue` 排队。codex_thread_wait 报告进度并返回偏移之后新出现的消息。只读取 $CODEX_HOME（默认 ~/.codex）下的本地会话记录，不把 Codex 数据发到别处，也不需要单独的登录。关闭后会移除这六个工具和 Codex 会话的提示，Codex 自己的会话不受影响。",
+    "detail": "docs/DETAIL.zh.md"
+  }
+}
