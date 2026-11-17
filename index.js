@@ -344,35 +344,65 @@ async function rolloutBuffer(file) {
   return entry
 }
 
-/** Read bytes `[from, from + maxBytes)` as utf8, dropping a leading and trailing partial line. */
+/**
+ * Turn one byte slice into whole-line text and line-aligned offsets.
+ * A leading partial line is dropped only when the slice really starts mid-line; a trailing
+ * incomplete line is dropped and both `start` and `end` stay on line boundaries, so re-reading
+ * from `end` never loses a record. (`from` usually comes from a previous `end`, which is
+ * already aligned, so this mostly protects an offset that was computed while the file grew.)
+ */
+function sliceLines(buffer, offsetOfStart, fileSize) {
+  let begin = 0
+  if (offsetOfStart > 0) {
+    if (buffer[0] === 0x0a) begin = 1
+    else {
+      const newline = buffer.indexOf(0x0a)
+      if (newline < 0) {
+        return { text: '', start: offsetOfStart + buffer.length, end: offsetOfStart + buffer.length, truncatedTail: false }
+      }
+      begin = newline + 1
+    }
+  }
+
+  const endOfData = offsetOfStart + buffer.length
+  const truncatedTail = endOfData < fileSize
+  let stop = buffer.length
+  if (truncatedTail) {
+    const lastNewline = buffer.lastIndexOf(0x0a)
+    if (lastNewline < begin) {
+      return { text: '', start: offsetOfStart + begin, end: offsetOfStart + begin, truncatedTail }
+    }
+    stop = lastNewline + 1
+  }
+
+  return {
+    text: buffer.subarray(begin, stop).toString('utf8'),
+    start: offsetOfStart + begin,
+    end: offsetOfStart + stop,
+    truncatedTail,
+  }
+}
+
+/** Read bytes `[from, from + maxBytes)` as utf8, aligned to whole lines. */
 async function readBytes(file, from, maxBytes) {
   if (ZSTD_EXT.test(file)) {
-    const { buffer, size } = await rolloutBuffer(file)
+    const { buffer: whole, size } = await rolloutBuffer(file)
     const start = Math.max(0, Math.min(from, size))
-    const length = Math.max(0, Math.min(size - start, maxBytes))
-    let text = length === 0 ? '' : buffer.subarray(start, start + length).toString('utf8')
-    if (start > 0 && text) {
-      const newline = text.indexOf('\n')
-      text = newline >= 0 ? text.slice(newline + 1) : ''
-    }
-    return { text, size, start, end: start + length, truncatedTail: start + length < size }
+    const probe = start > 0 ? start - 1 : 0
+    const slice = whole.subarray(probe, Math.min(size, start + maxBytes))
+    return { ...sliceLines(slice, probe, size), size }
   }
 
   const handle = await fsp.open(file, 'r')
   try {
     const { size } = await handle.stat()
     const start = Math.max(0, Math.min(from, size))
-    const length = Math.max(0, Math.min(size - start, maxBytes))
+    const probe = start > 0 ? start - 1 : 0
+    const length = Math.max(0, Math.min(size, start + maxBytes) - probe)
     if (length === 0) return { text: '', size, start, end: start, truncatedTail: false }
     const buffer = Buffer.alloc(length)
-    await handle.read(buffer, 0, length, start)
-    let text = buffer.toString('utf8')
-    if (start > 0) {
-      const newline = text.indexOf('\n')
-      text = newline >= 0 ? text.slice(newline + 1) : ''
-    }
-    const truncatedTail = start + length < size
-    return { text, size, start, end: start + length, truncatedTail }
+    await handle.read(buffer, 0, length, probe)
+    return { ...sliceLines(buffer, probe, size), size }
   } finally {
     await handle.close()
   }
@@ -789,9 +819,12 @@ function newTool(ctx) {
           `  task:   ${turn.taskId} (${turn.status})`,
           `  offset: 0`,
           '',
-          `Read it with codex_thread_read { thread: "${id}" },`,
-          `follow the first turn with codex_thread_wait { thread: "${id}", fromOffset: 0 },`,
-          `and keep the collaboration going with codex_thread_send { thread: "${id}", message: "..." }.`,
+          `Codex is working now. Do your own share before collecting: read the code it will touch,`,
+          `run the project's build/tests to capture a baseline, draft fixtures or tests, or split the`,
+          `rest of the task. Then collect with codex_thread_wait { thread: "${id}", fromOffset: 0 }`,
+          `only when you actually need those results.`,
+          `Keep the collaboration going with codex_thread_send { thread: "${id}", message: "..." }`,
+          `and send the merged result back through codex_thread_review.`,
         ].join('\n'),
         threadId: id,
         cwd,
@@ -1004,11 +1037,14 @@ function sendTool() {
               `  state:  ${verdict === 'pending' ? 'running (no terminal event yet)' : 'running'}`,
               `  offset: ${fromOffset}`,
               '',
-              `Read progress with codex_thread_wait { thread: "${id}", fromOffset: ${fromOffset} }.`,
+              'Codex is working now. Do your own share first — read the code it will touch, run the',
+              'build/tests for a baseline, draft fixtures or tests, or split what is left. Collect with',
+              `codex_thread_wait { thread: "${id}", fromOffset: ${fromOffset} } only when you need these`,
+              'results, and use codex_thread_review for an independent review before delivering.',
             ].join('\n'),
             threadId: id,
             delivery: 'turn',
-            model,
+            model: selection.model,
             taskId: turn.taskId,
             fromOffset,
           }
@@ -1023,8 +1059,10 @@ function sendTool() {
               `  offset:  ${fromOffset}`,
               hasSelection ? `  model:   NOT applied (${describeSelection(selection)}) — a queued message always runs what the session already uses.` : '',
               '',
-              'The Codex app will run it as its next turn. Poll with',
-              `codex_thread_wait { thread: "${id}", fromOffset: ${fromOffset} }.`,
+              'The Codex app runs it as its next turn on its own schedule — nothing here can start it.',
+              'Do your own share meanwhile; check back with',
+              `codex_thread_wait { thread: "${id}", fromOffset: ${fromOffset} } when you need the result,`,
+              'and do not poll in a loop.',
             ].filter((line) => line !== '').join('\n'),
             threadId: id,
             delivery: 'queued',
@@ -1045,7 +1083,8 @@ function sendTool() {
           ...(hasSelection ? [`  model:   not applied (${describeSelection(selection)}) — a queued message always runs what the session already uses.`] : []),
           '',
           'The Codex app runs queued messages on its own schedule; nothing runs until a Codex process resumes this thread.',
-          `Poll with codex_thread_wait { thread: "${id}", fromOffset: ${fromOffset} }.`,
+          'Do your own share meanwhile, then use',
+          `codex_thread_wait { thread: "${id}", fromOffset: ${fromOffset} } once you need the result.`,
         ].join('\n'),
         threadId: id,
         delivery: 'queued',
@@ -1060,7 +1099,7 @@ function waitTool() {
   return {
     name: 'codex_thread_wait',
     description:
-      'Wait for a Codex session to advance, then return the messages that appeared after `fromOffset`. Reports the live turn state, so a long Codex turn can be followed in steps instead of one blocking call.',
+      'Wait for a Codex session to advance, then return what appeared after `fromOffset`. Returns early by default: use it to check on progress between other work, not as one long block. Prefer sending an instruction, doing your own work, then waiting here — a single long wait leaves you idle while Codex works.',
     parameters: {
       type: 'object',
       properties: {
@@ -1070,17 +1109,28 @@ function waitTool() {
           minimum: 0,
           description: 'Byte offset returned by codex_thread_read or codex_thread_send; omit to wait only for the next turn boundary.',
         },
-        timeoutMs: { type: 'integer', minimum: 1000, maximum: 600000, description: 'Total wait; defaults to 60000.' },
-        settleMs: { type: 'integer', minimum: 0, maximum: 600000, description: 'Idle time after new activity before returning; defaults to 0.' },
+        until: {
+          type: 'string',
+          enum: ['activity', 'message', 'turn-complete'],
+          description: 'When to return: any new record (default), the first user/assistant message, or the whole turn finishing. Only turn-complete waits for the end.',
+        },
+        timeoutMs: {
+          type: 'integer',
+          minimum: 1000,
+          maximum: 120000,
+          description: 'Total wait, capped at 120s; defaults to 12000. Waiting longer than that is almost always better expressed as other work followed by another call.',
+        },
+        settleMs: { type: 'integer', minimum: 0, maximum: 600000, description: 'Idle time after new activity before returning in turn-complete mode; defaults to 0.' },
       },
       required: ['thread'],
       additionalProperties: false,
     },
-    timeoutMs: 660000,
+    timeoutMs: 180000,
     output: TEXT_OUTPUT,
-    async execute(args) {
+    async execute(args, exec) {
       const { id, rollout } = await requireThread(args?.thread)
-      const total = Math.min(Math.max(Number(args?.timeoutMs ?? 60000) || 60000, 1000), 600000)
+      const until = args?.until === 'message' || args?.until === 'turn-complete' ? args.until : 'activity'
+      const total = Math.min(Math.max(Number(args?.timeoutMs ?? 12000) || 12000, 1000), 120000)
       const settle = Math.min(Math.max(Number(args?.settleMs ?? 0) || 0, 0), 600000)
       const from = Number.isInteger(args?.fromOffset) && args.fromOffset >= 0 ? args.fromOffset : undefined
       const start = Date.now()
@@ -1088,14 +1138,26 @@ function waitTool() {
       let activityAt
       let state = 'idle'
       let lossy = false
+      let cancelled = false
 
       for (;;) {
+        if (exec?.signal?.aborted) {
+          cancelled = true
+          break
+        }
         const info = await inspectThread(id, rollout)
         state = info.state.state
         if (offset === undefined) offset = info.size
-        if (info.size > offset) activityAt = activityAt ?? Date.now()
-        const settledNow = state === 'idle' && (activityAt === undefined || Date.now() - activityAt >= settle)
-        if (settledNow && info.size > offset) break
+        const grew = info.size > offset
+        if (grew) activityAt = activityAt ?? Date.now()
+
+        if (grew && until === 'activity') break
+        if (grew && until === 'message') {
+          const peek = await readBytes(rollout, offset, MAX_SEGMENT_BYTES)
+          if (parseRollout(peek.text).some((record) => record.kind === 'user' || record.kind === 'assistant')) break
+        }
+        if (until === 'turn-complete' && grew && state === 'idle' && Date.now() - (activityAt ?? Date.now()) >= settle) break
+
         if (Date.now() - start >= total) break
         await new Promise((resolve) => setTimeout(resolve, POLL_MS))
       }
@@ -1109,9 +1171,18 @@ function waitTool() {
       const turn = turnOf(id)
       const elapsed = Date.now() - start
       const idle = info.state.state === 'idle'
+      const reason = cancelled
+        ? 'cancelled by the caller'
+        : idle
+          ? 'turn finished'
+          : until === 'turn-complete'
+            ? 'still working'
+            : messages.length > 0
+              ? 'returned on new activity'
+              : 'timed out'
       const header = [
         `Thread ${id}: ${info.state.state}${info.state.at ? ` (last turn boundary ${clockOf(info.state.at)})` : ''}`,
-        `  waited:  ${elapsed} ms${idle ? '' : ' — Codex is still working'}`,
+        `  waited:  ${elapsed} ms — ${reason}`,
         `  from:    ${offset} → ${segment.end} of ${info.size} bytes${lossy ? ' (truncated)' : ''}`,
       ]
       if (turn) header.push(`  task:    ${turn.taskId}${idle ? ' (turn finished)' : ` ${turn.status}`}`)
@@ -1120,16 +1191,115 @@ function waitTool() {
         : ['', `New messages (${messages.length}):`, ...messages.map((message, index) =>
           `${index + 1}. [${message.kind === 'user' ? 'user' : 'codex'} ${clockOf(message.at)}] ${clip(message.text, 4000)}`)]
       const activity = tools.length === 0 ? [] : ['', `Tool calls: ${tools.join(', ')}`]
+      // Say what to do next, so a short wait does not turn into another immediate wait.
+      const next = idle
+        ? `Done. nextOffset is ${segment.end}; the next turn starts a new range.`
+        : `Still working. Do other work now, then call codex_thread_wait again with fromOffset ${segment.end}${until === 'turn-complete' ? '' : ', or use until:"turn-complete" if nothing else is pending'}.`
       return {
-        text: [...header, ...body, ...activity, '', `nextOffset: ${segment.end}`].join('\n'),
+        text: [...header, ...body, ...activity, '', next].join('\n'),
         threadId: id,
         state: info.state.state,
         idle,
+        cancelled,
+        until,
+        reason,
         elapsedMs: elapsed,
         nextOffset: segment.end,
         lossy,
         messages: messages.map((message) => ({ role: message.kind, at: message.at, text: message.text })),
       }
+    },
+  }
+}
+
+/**
+ * Hand finished work back to Codex for an independent review. It is a `codex_thread_send`
+ * with a review brief: the point is that the caller keeps working while Codex reads.
+ */
+function reviewTool() {
+  return {
+    name: 'codex_thread_review',
+    description:
+      'Send finished work back to a Codex session for an independent review. Returns immediately: keep working while Codex reads the result, then collect it with codex_thread_wait. Use this before delivering anything Codex helped produce.',
+    parameters: {
+      type: 'object',
+      properties: {
+        thread: { type: 'string', description: 'Thread id, codex://threads/<id> link, or rollout path.' },
+        summary: { type: 'string', description: 'What was done and what should be reviewed, in a few lines.' },
+        paths: { type: 'array', items: { type: 'string' }, description: 'Files or directories in scope.' },
+        focus: {
+          type: 'string',
+          enum: ['correctness', 'maintainability', 'risk', 'tests', 'all'],
+          description: 'Review focus; defaults to all.',
+        },
+        evidence: { type: 'string', description: 'Verification you already ran (build, tests, lint) and its outcome.' },
+        cwd: { type: 'string', description: 'Directory to review from; defaults to the directory recorded in the session.' },
+      },
+      required: ['thread', 'summary'],
+      additionalProperties: false,
+    },
+    output: TEXT_OUTPUT,
+    async execute(args) {
+      const { id, rollout } = await requireThread(args?.thread)
+      const summary = typeof args?.summary === 'string' ? args.summary.trim() : ''
+      if (!summary) throw new Error('codex-thread: summary must not be empty.')
+      const focus = ['correctness', 'maintainability', 'risk', 'tests', 'all'].includes(args?.focus) ? args.focus : 'all'
+      const paths = Array.isArray(args?.paths)
+        ? args.paths.filter((path) => typeof path === 'string' && path.trim()).map((path) => path.trim())
+        : []
+      const evidence = typeof args?.evidence === 'string' && args.evidence.trim() ? args.evidence.trim() : ''
+      const info = await inspectThread(id, rollout)
+      const fromOffset = info.size
+      const cwd = typeof args?.cwd === 'string' && args.cwd.trim() ? args.cwd.trim() : info.context.cwd
+
+      const live = turnOf(id)
+      if (live) {
+        return {
+          text: `Thread ${id} already has a turn started by this DSH process (${live.taskId}, ${live.status}). Cancel it or wait for it before starting a review.`,
+          threadId: id,
+          delivery: 'none',
+          taskId: live.taskId,
+          fromOffset,
+        }
+      }
+
+      const message = [
+        'Review this work as a reviewer, not as an implementer. Do not modify files.',
+        '',
+        `What changed: ${summary}`,
+        paths.length > 0 ? `\nFiles in scope:\n${paths.map((path) => `- ${path}`).join('\n')}` : '',
+        evidence ? `\nVerification already run: ${evidence}` : '\nVerification already run: nothing reported — say so if that blocks the review.',
+        `\nFocus: ${focus}.`,
+        '',
+        'For every finding give: severity (high/medium/low), location (file:line), the concrete problem, and the smallest fix.',
+        'If an area is correct, say so in one line instead of padding. End with a verdict: ship / fix-then-ship / rework.',
+      ].filter(Boolean).join('\n')
+
+      const turn = startTurn(id, message, cwd, {})
+      const started = await Promise.race([
+        turn.started,
+        new Promise((resolve) => setTimeout(() => resolve('pending'), PROBE_MS)),
+      ])
+      if (started === 'started' || started === 'pending') {
+        return {
+          text: [
+            `Review started on Codex thread ${id} (taskId ${turn.taskId}).`,
+            `  cwd:    ${cwd ?? '(Codex default)'}`,
+            `  focus:  ${focus}`,
+            `  offset: ${fromOffset}`,
+            '',
+            'Keep working — do not wait here. When the review is ready, collect it with',
+            `codex_thread_wait { thread: "${id}", fromOffset: ${fromOffset} }.`,
+          ].join('\n'),
+          threadId: id,
+          delivery: 'turn',
+          taskId: turn.taskId,
+          focus,
+          fromOffset,
+        }
+      }
+      turns.delete(turn.taskId)
+      throw new Error(`codex-thread: the review turn did not start: ${turn.settled ?? turn.detail ?? 'unknown failure'}`)
     },
   }
 }
@@ -1184,6 +1354,7 @@ export function apply(ctx) {
     listTool(),
     readTool(),
     sendTool(),
+    reviewTool(),
     waitTool(),
     cancelTool(),
   ]
@@ -1207,10 +1378,15 @@ export function apply(ctx) {
       order: 96,
       text: [
         '## Codex sessions',
-        'The user may paste a `codex://threads/<uuid>` link, name a Codex session, or point at a rollout file.',
-        'Call `codex_thread_read` with that value before answering about it; it returns the session directory, the model, whether Codex is running the session now, and recent messages.',
-        '`codex_thread_send` continues that same session and never forks it. `codex_thread_wait` reports progress and returns the messages that appeared after an offset.',
-        'When the work needs a Codex session that does not exist yet, `codex_thread_new` opens one in a directory and its returned thread id works with the other four tools.',
+        'The user may paste a `codex://threads/<uuid>` link, name a Codex session, or point at a rollout file. Call `codex_thread_read` with that value before answering about it; it returns the session directory, the model, whether Codex is running the session now, and recent messages. `codex_thread_new` opens a session that does not exist yet.',
+        '',
+        '### Run Codex work in parallel, never idle',
+        '`codex_thread_send` never blocks: it returns while Codex is still working. Treat it as handing work to a colleague, not as a request you must sit through.',
+        '1. Split first. Decide what Codex owns (the part that needs its context, model, or tools) and what you can do yourself: read code, run the project\'s build/tests/lint to get a baseline, write fixtures, skeletons, or tests, and gather the facts Codex will need.',
+        '2. Do your share immediately after sending. Two things can then happen at once. Keep a short list of what you finished.',
+        '3. Collect only when you need it: `codex_thread_wait` with the returned `fromOffset`, and only when nothing else can proceed. Never wait in a loop, and never pass a long timeout as a way to avoid thinking about what else to do.',
+        '4. Review before delivering. `codex_thread_review` sends the merged result back to Codex for an independent review while you keep working.',
+        'Waiting with nothing to do is the failure mode this plugin exists to avoid: one long `codex_thread_wait` occupies a whole model step and produces nothing.',
       ].join('\n'),
     }))
   }

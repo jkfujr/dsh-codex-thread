@@ -11,8 +11,9 @@
 | `codex_thread_new` | **开一个全新的 Codex 会话**并下达第一条指令，返回新会话 id；`cwd` 决定工作目录，`model` 指定模型 |
 | `codex_thread_list` | 列出最近的 Codex 会话（名字、时间、是否正被 Codex 应用占用） |
 | `codex_thread_read` | 读一个会话：工作目录、模型、当前轮次状态、最近消息、工具活动，并返回 `nextOffset` |
-| `codex_thread_send` | 向会话下发指令并继续它；返回交付方式 `turn` 或 `queued` 与 `fromOffset`；`model` 仅 `turn` 路径生效 |
-| `codex_thread_wait` | 等会话推进，返回 `fromOffset` 之后新出现的消息与当前状态 |
+| `codex_thread_send` | 向会话下发指令并继续它；返回交付方式 `turn` 或 `queued` 与 `fromOffset`；`model` 等仅 `turn` 路径生效 |
+| `codex_thread_review` | 把合并后的结果交回 Codex 做**独立审查**，立即返回，DSH 继续干活 |
+| `codex_thread_wait` | 短窗收集进度：默认 12s、上限 120s，`until` 三档，超时会给下一步 |
 | `codex_thread_cancel` | 取消**本进程**发起的那一轮；Codex 应用自己跑的轮次需在 Codex 里中断 |
 
 新会话建好后就是普通会话：`codex_thread_read` / `send` / `wait` / `cancel` 都认这个 id，所以「开新会话 → 派活 → 跟进 → 继续追问」是同一条闭环。
@@ -85,6 +86,22 @@ low → medium → high → xhigh → max → ultra
 `~/.codex/models_cache.json` 里的 id（0.169.0 上是 `gpt-6.1-sol`、`gpt-6-astra`、`gpt-6.1-terra`、`gpt-6-sol`、`gpt-reserve`、`gpt-6-luna`、`gpt-5.6-sol`、`gpt-5.6-terra`、`gpt-5.6-luna`、`codex-auto-review`）只是 CLI 自带目录的候选，**不是上限**：`config` 参数能把任意 provider / model / effort 塞进去，自定义 provider 也走这条路。
 
 每次真实调用用了哪个模型，以 `codex_thread_read` 输出里的 `model:` 行为准——那行来自 rollout 的 `turn_context`，是 Codex 自己记的。
+
+## 编排：让 Codex 干活，同时 DSH 不干等
+
+`codex_thread_send` 在 Codex 还在跑时就返回。正确用法是把它当"交给同事"，而不是"必须守着等它办完"。
+
+| 阶段 | 谁做 | 做什么 |
+|---|---|---|
+| 1 拆分 | DSH | 定哪部分交给 Codex（需要它的上下文/模型/工具），哪部分自己干 |
+| 2 并行 | DSH | 读代码、跑构建/测试拿基线、写 fixture 与测试骨架、拆剩余子任务、准备 Codex 需要的上下文 |
+| 3 收编 | DSH | 需要结果时才 `codex_thread_wait`，短窗、不轮询；合并两份产出并跑验证 |
+| 4 回审 | Codex | `codex_thread_review` 交回独立审查，DSH 在它审的时候继续补测试/写文档 |
+| 5 落地 | DSH | 按审查结论修，再交付 |
+
+**唯一该等的情况**：手上确实没有可并行的工作。这时也要用短窗 + `until:"turn-complete"`，而不是一次 300 秒。
+
+一个真实反例（本插件优化前的实测）：某个 78 小时的会话里 `codex_thread_wait` 占掉全部工具时间的 **96.9%**，192 次调用有 159 次显式传了 `timeoutMs: 300000`，中位数 300.3 秒；其中一次下发后连续 29 次 wait、耗掉 2.3 小时。根因不在工具，而在"发完就去等"的默认习惯——现在返回值里会明确写"先去干自己的活"。
 
 ## 读取侧
 
