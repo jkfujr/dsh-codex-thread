@@ -253,7 +253,7 @@ function rankRollout(entry) {
 
 function rolloutMap() {
   if (Date.now() - rolloutCache.at < 30000) return rolloutCache.byId
-  const best = new Map()
+  const all = new Map()
   const walk = (dir, depth) => {
     if (depth > 4) return
     for (const entry of safeReaddir(dir)) {
@@ -271,23 +271,41 @@ function rolloutMap() {
       if (!ROLLOUT_NAME.test(entry)) continue
       const candidate = rankRollout(entry)
       if (!candidate) continue
-      const current = best.get(candidate.id)
-      if (!current || candidate.rank < current.rank) best.set(candidate.id, { path: full, rank: candidate.rank })
+      const list = all.get(candidate.id) ?? []
+      list.push({ path: full, rank: candidate.rank, mtimeMs: stats.mtimeMs })
+      all.set(candidate.id, list)
     }
   }
   walk(sessionsRoot(), 0)
   const byId = new Map()
-  for (const [id, entry] of best) byId.set(id, entry.path)
+  for (const [id, list] of all) {
+    // Best rank is the thread's own rollout; the rest are continuations that keep growing.
+    list.sort((a, b) => (a.rank - b.rank) || (b.mtimeMs - a.mtimeMs))
+    byId.set(id, list)
+  }
   rolloutCache = { at: Date.now(), byId }
   return byId
 }
 
-function rolloutOf(threadId) {
+function rolloutEntries(threadId) {
   const hit = rolloutMap().get(threadId)
   if (hit) return hit
   // A session created moments ago may predate the cached scan; miss once, then rescan.
   rolloutCache = { at: 0, byId: new Map() }
-  return rolloutMap().get(threadId)
+  return rolloutMap().get(threadId) ?? []
+}
+
+function rolloutOf(threadId) {
+  return rolloutEntries(threadId)[0]?.path
+}
+
+/**
+ * Every file that belongs to a thread, newest write first. A continued session writes its
+ * later turns into a sibling file, and the original rollout's mtime can stay frozen at
+ * creation, so live state has to consider all of them.
+ */
+function siblingRollouts(threadId) {
+  return [...rolloutEntries(threadId)].sort((a, b) => b.mtimeMs - a.mtimeMs)
 }
 
 /** Drop cached store indexes after creating a session so the new rollout resolves immediately. */
@@ -560,15 +578,42 @@ async function inspectThread(id, rollout) {
   ])
   const headRecords = parseRollout(head.text)
   const records = parseRollout(tail.text)
-  const parsed = stateOf([...headRecords, ...records])
-  const stale = parsed.state === 'running' && Date.now() - stats.mtimeMs > STALE_TURN_MS
+
+  // Live state must consider every file of the thread. A continued session writes later
+  // turns into a sibling rollout, and the original file's mtime can stay frozen at
+  // creation, so neither one alone is trustworthy.
+  const siblings = siblingRollouts(id)
+  const newestMs = Math.max(stats.mtimeMs, ...siblings.map((entry) => entry.mtimeMs))
+  let state = { state: 'idle', at: '' }
+  let sawBoundary = false
+  const consider = (list) => {
+    if (!list.some((record) => record.kind === 'start' || record.kind === 'done')) return
+    sawBoundary = true
+    const found = stateOf(list)
+    if (!state.at || found.at > state.at) state = found
+  }
+  consider(records)
+  for (const sibling of siblings.slice(0, 3)) {
+    if (sibling.path === rollout) continue
+    try {
+      const siblingSize = await fileSize(sibling.path)
+      const chunk = await readBytes(sibling.path, Math.max(0, siblingSize - TAIL_BYTES), TAIL_BYTES)
+      consider(parseRollout(chunk.text))
+    } catch {}
+  }
+  if (!sawBoundary) {
+    state = { state: Date.now() - newestMs < STALE_TURN_MS ? 'running' : 'idle', at: '', inferred: true }
+  }
+  const stale = state.state === 'running' && !state.inferred && Date.now() - newestMs > STALE_TURN_MS
+
   return {
     id,
     rollout,
+    siblingCount: siblings.length,
     size,
-    updatedMs: stats.mtimeMs,
+    updatedMs: newestMs,
     context: contextOf([...headRecords, ...records]),
-    state: stale ? { state: 'idle', at: parsed.at, stale: true } : parsed,
+    state: stale ? { state: 'idle', at: state.at, stale: true } : state,
     records,
     tailTruncated: tail.start > 0,
   }
@@ -932,7 +977,7 @@ function readTool() {
         `  cwd:      ${info.context.cwd ?? '(unknown)'}`,
         `  model:    ${info.context.model ?? '(unknown)'}${info.context.effort ? ` (effort ${info.context.effort})` : ''}`,
         `  origin:   ${info.context.originator ?? '(unknown)'}${info.context.cli ? ` / cli ${info.context.cli}` : ''}`,
-        `  state:    ${info.state.state}${info.state.stale ? ' (a turn start has no completion in this rollout)' : info.state.at ? ` (last turn boundary ${clockOf(info.state.at)})` : ''}`,
+        `  state:    ${info.state.state}${info.state.inferred ? ' (inferred from the rollout write time; no turn boundary in the read window)' : info.state.stale ? ' (a turn start has no completion in this rollout)' : info.state.at ? ` (last turn boundary ${clockOf(info.state.at)})` : ''}`,
         `  rollout:  ${rollout}`,
         `  updated:  ${new Date(info.updatedMs).toLocaleString('sv-SE', { hour12: false })}`,
         `  size:     ${info.size} bytes${info.tailTruncated ? `, reading the last ${TAIL_BYTES} bytes` : ''}`,
@@ -1071,7 +1116,10 @@ function sendTool() {
           }
         }
         turns.delete(turn.taskId)
-        throw new Error(`codex-thread: the Codex turn did not start: ${turn.settled ?? turn.detail ?? 'unknown failure'}`)
+        throw new Error(
+          `codex-thread: the Codex turn did not start: ${turn.settled ?? turn.detail ?? 'unknown failure'}\n` +
+            `This usually means the Codex app holds the session's writer lock. Retry with mode "auto" or "queue".`,
+        )
       }
 
       const queued = await queueMessage(id, message)
@@ -1220,7 +1268,7 @@ function reviewTool() {
   return {
     name: 'codex_thread_review',
     description:
-      'Send finished work back to a Codex session for an independent review. Returns immediately: keep working while Codex reads the result, then collect it with codex_thread_wait. Use this before delivering anything Codex helped produce.',
+      'Send finished work back to a Codex session for an independent review. Returns immediately: keep working while Codex reads the result, then collect it with codex_thread_wait. Falls back to the Codex queue when the Codex app holds the session\'s writer lock. Use this before delivering anything Codex helped produce.',
     parameters: {
       type: 'object',
       properties: {
@@ -1294,6 +1342,28 @@ function reviewTool() {
           threadId: id,
           delivery: 'turn',
           taskId: turn.taskId,
+          focus,
+          fromOffset,
+        }
+      }
+      // The Codex app holds the writer lock on an open session, so the review is queued
+      // instead of failing: a review that cannot start is worse than a late one.
+      if (started === 'writer-conflict') {
+        turns.delete(turn.taskId)
+        const queued = await queueMessage(id, message)
+        return {
+          text: [
+            `Codex owns thread ${id} (the app holds its writer lock), so the review was queued:`,
+            `  queueId: ${queued.queueId ?? '(unreported)'}`,
+            `  focus:   ${focus}`,
+            `  offset:  ${fromOffset}`,
+            '',
+            'The Codex app runs it as its next turn. Collect it with',
+            `codex_thread_wait { thread: "${id}", fromOffset: ${fromOffset} }.`,
+          ].join('\n'),
+          threadId: id,
+          delivery: 'queued',
+          queueId: queued.queueId,
           focus,
           fromOffset,
         }
