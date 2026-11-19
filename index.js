@@ -25,7 +25,10 @@ const UUID_RE_G = new RegExp(UUID_RE.source, 'gi')
 const TAIL_BYTES = 256 * 1024
 const MAX_SEGMENT_BYTES = 2 * 1024 * 1024
 const WRITER_CONFLICT = /already has an active writer/i
-const PROBE_MS = 3000
+// How long a spawned `codex exec` may stay silent before it counts as blocked rather than
+// slow. Codex acknowledges a turn with `thread.started` almost immediately when it can open
+// the thread, and blocks without a word when another process holds it.
+const ACK_MS = 8000
 const POLL_MS = 700
 
 const TEXT_OUTPUT = Object.freeze({
@@ -1071,15 +1074,52 @@ function sendTool() {
         const turn = startTurn(id, message, cwd, selection)
         const verdict = await Promise.race([
           turn.started,
-          new Promise((resolve) => setTimeout(() => resolve('pending'), PROBE_MS)),
+          new Promise((resolve) => setTimeout(() => resolve('unacknowledged'), ACK_MS)),
         ])
-        if (verdict === 'started' || verdict === 'pending') {
+        // A turn that never acknowledges is not a turn: `codex exec resume` can block on a
+        // session the Codex app holds instead of failing, so killing it and queueing is the
+        // only honest outcome. Never report a blocked child as running.
+        if (verdict === 'unacknowledged') {
+          turns.delete(turn.taskId)
+          kill(turn.child)
+          if (mode === 'auto') {
+            const queued = await queueMessage(id, message)
+            return {
+              text: [
+                `Codex did not acknowledge the turn within ${ACK_MS / 1000}s (it is most likely blocked by the Codex app's writer lock), so the instruction was queued instead:`,
+                `  queueId: ${queued.queueId ?? '(unreported)'}`,
+                `  offset:  ${fromOffset}`,
+                hasSelection ? `  model:   NOT applied (${describeSelection(selection)}) — a queued message always runs what the session already uses.` : '',
+                '',
+                'The Codex app runs it as its next turn. Check back with',
+                `codex_thread_wait { thread: "${id}", fromOffset: ${fromOffset} } when you need the result.`,
+              ].filter((line) => line !== '').join('\n'),
+              threadId: id,
+              delivery: 'queued',
+              modelApplied: false,
+              fromOffset,
+            }
+          }
+          return {
+            text: [
+              `Codex did not acknowledge the turn within ${ACK_MS / 1000}s; the child was killed.`,
+              '  most likely: the Codex app holds this session and the CLI blocked instead of failing',
+              `  offset: ${fromOffset}`,
+              '',
+              'Retry with mode "auto" or "queue" to deliver through the queue instead.',
+            ].join('\n'),
+            threadId: id,
+            delivery: 'unacknowledged',
+            fromOffset,
+          }
+        }
+        if (verdict === 'started') {
           return {
             text: [
               `Sent to Codex thread ${id} as an owned turn (taskId ${turn.taskId}).`,
               `  cwd:    ${cwd ?? '(Codex default)'}`,
               `  model:  ${describeSelection(selection)}${selection.model || selection.profile || selection.config ? '' : ` (session recorded ${info.context.model ?? 'unknown'})`}`,
-              `  state:  ${verdict === 'pending' ? 'running (no terminal event yet)' : 'running'}`,
+              `  state:  running`,
               `  offset: ${fromOffset}`,
               '',
               'Codex is working now. Do your own share first — read the code it will touch, run the',
@@ -1326,9 +1366,9 @@ function reviewTool() {
       const turn = startTurn(id, message, cwd, {})
       const started = await Promise.race([
         turn.started,
-        new Promise((resolve) => setTimeout(() => resolve('pending'), PROBE_MS)),
+        new Promise((resolve) => setTimeout(() => resolve('unacknowledged'), ACK_MS)),
       ])
-      if (started === 'started' || started === 'pending') {
+      if (started === 'started') {
         return {
           text: [
             `Review started on Codex thread ${id} (taskId ${turn.taskId}).`,
@@ -1347,9 +1387,11 @@ function reviewTool() {
         }
       }
       // The Codex app holds the writer lock on an open session, so the review is queued
-      // instead of failing: a review that cannot start is worse than a late one.
-      if (started === 'writer-conflict') {
+      // instead of failing: a review that cannot start is worse than a late one. The same
+      // applies when the CLI blocks silently instead of reporting the conflict.
+      if (started === 'writer-conflict' || started === 'unacknowledged') {
         turns.delete(turn.taskId)
+        kill(turn.child)
         const queued = await queueMessage(id, message)
         return {
           text: [
